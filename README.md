@@ -2,7 +2,7 @@
   <img src="/assets/banner.png" alt="Moodist Logo Banner" />
   <h2>Moodist for Android 🌲</h2>
   <p>A fork of <a href="https://github.com/remvze/moodist">Moodist</a>, packaged for Android.</p>
-  <p><a href="https://github.com/TheJYU/moodist-android/releases"><strong>Download the Latest APK from Releases</strong></a></p>
+  <p><a href="https://github.com/YamenSharaf/moodist-android/releases/latest"><strong>Download the Latest APK from Releases</strong></a></p>
 </div>
 
 ## About This Project
