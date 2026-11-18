@@ -5,8 +5,13 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.media.AudioManager;
 import android.os.Build;
 import android.os.IBinder;
 import android.support.v4.media.MediaMetadataCompat;
@@ -16,6 +21,9 @@ import android.support.v4.media.session.PlaybackStateCompat;
 import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
+import androidx.media.AudioAttributesCompat;
+import androidx.media.AudioFocusRequestCompat;
+import androidx.media.AudioManagerCompat;
 import androidx.media.app.NotificationCompat.MediaStyle;
 
 import io.github.thejyu.moodist.MainActivity;
@@ -35,6 +43,52 @@ public class MediaPlaybackService extends Service {
 
     private MediaSessionCompat session;
     private boolean inForeground = false;
+    private Bitmap artwork;
+
+    private AudioManager audioManager;
+    private AudioFocusRequestCompat focusRequest;
+    private boolean hasFocus = false;
+    /** We paused because of a transient focus loss (e.g. a phone call) and should resume after. */
+    private boolean resumeOnFocusGain = false;
+    private boolean noisyReceiverRegistered = false;
+
+    /** Headphones unplugged / Bluetooth disconnected → pause instead of blasting the speaker. */
+    private final BroadcastReceiver noisyReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (AudioManager.ACTION_AUDIO_BECOMING_NOISY.equals(intent.getAction()) && MediaState.playing) {
+                resumeOnFocusGain = false;
+                MediaState.dispatch("pause");
+            }
+        }
+    };
+
+    private final AudioManager.OnAudioFocusChangeListener focusListener = change -> {
+        switch (change) {
+            case AudioManager.AUDIOFOCUS_GAIN:
+                if (resumeOnFocusGain) {
+                    resumeOnFocusGain = false;
+                    MediaState.dispatch("play");
+                }
+                break;
+            case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
+                // Phone call, navigation prompt, assistant… pause and resume afterwards.
+                if (MediaState.playing) {
+                    resumeOnFocusGain = true;
+                    MediaState.dispatch("pause");
+                }
+                break;
+            case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK:
+                // The system lowers our volume automatically (willPauseWhenDucked = false).
+                break;
+            case AudioManager.AUDIOFOCUS_LOSS:
+                // Another app started playing for good (e.g. music) → pause and stay paused.
+                resumeOnFocusGain = false;
+                abandonFocus();
+                if (MediaState.playing) MediaState.dispatch("pause");
+                break;
+        }
+    };
 
     /** Starts the service, or refreshes it if already running. Call on the main thread. */
     static void sync(Context context) {
@@ -60,6 +114,19 @@ public class MediaPlaybackService extends Service {
         super.onCreate();
         instance = this;
         createChannel();
+
+        artwork = BitmapFactory.decodeResource(getResources(), R.drawable.media_artwork);
+        audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        focusRequest = new AudioFocusRequestCompat.Builder(AudioManagerCompat.AUDIOFOCUS_GAIN)
+            .setAudioAttributes(
+                new AudioAttributesCompat.Builder()
+                    .setUsage(AudioAttributesCompat.USAGE_MEDIA)
+                    .setContentType(AudioAttributesCompat.CONTENT_TYPE_MUSIC)
+                    .build()
+            )
+            .setWillPauseWhenDucked(false)
+            .setOnAudioFocusChangeListener(focusListener)
+            .build();
 
         session = new MediaSessionCompat(this, "Moodist");
         session.setCallback(new MediaSessionCompat.Callback() {
@@ -90,6 +157,8 @@ public class MediaPlaybackService extends Service {
     @Override
     public void onDestroy() {
         if (instance == this) instance = null;
+        abandonFocus();
+        setNoisyReceiver(false);
         if (session != null) {
             session.setActive(false);
             session.release();
@@ -115,6 +184,7 @@ public class MediaPlaybackService extends Service {
             new MediaMetadataCompat.Builder()
                 .putString(MediaMetadataCompat.METADATA_KEY_TITLE, MediaState.title)
                 .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, MediaState.text)
+                .putBitmap(MediaMetadataCompat.METADATA_KEY_ART, artwork)
                 .build()
         );
         session.setPlaybackState(
@@ -132,6 +202,14 @@ public class MediaPlaybackService extends Service {
                 )
                 .build()
         );
+
+        if (playing) {
+            // Explicit play (from the app or a button) cancels any pending auto-resume.
+            resumeOnFocusGain = false;
+            requestFocus();
+        }
+        // Keep focus while paused, so we're told when a call ends and can resume.
+        setNoisyReceiver(playing);
 
         Notification notification = buildNotification(playing);
 
@@ -159,7 +237,32 @@ public class MediaPlaybackService extends Service {
         if (manager.areNotificationsEnabled()) manager.notify(NOTIFICATION_ID, notification);
     }
 
+    private void requestFocus() {
+        if (hasFocus) return;
+        hasFocus = AudioManagerCompat.requestAudioFocus(audioManager, focusRequest)
+            == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
+    }
+
+    private void abandonFocus() {
+        if (!hasFocus) return;
+        AudioManagerCompat.abandonAudioFocusRequest(audioManager, focusRequest);
+        hasFocus = false;
+    }
+
+    private void setNoisyReceiver(boolean enabled) {
+        if (enabled == noisyReceiverRegistered) return;
+        if (enabled) {
+            registerReceiver(noisyReceiver, new IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY));
+        } else {
+            unregisterReceiver(noisyReceiver);
+        }
+        noisyReceiverRegistered = enabled;
+    }
+
     private void stopAll() {
+        resumeOnFocusGain = false;
+        abandonFocus();
+        setNoisyReceiver(false);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE);
         } else {
@@ -185,6 +288,7 @@ public class MediaPlaybackService extends Service {
             .setSmallIcon(R.drawable.ic_stat_moodist)
             .setContentTitle(MediaState.title)
             .setContentText(MediaState.text)
+            .setLargeIcon(artwork)
             .setContentIntent(contentIntent)
             .setDeleteIntent(broadcast(MediaActionReceiver.ACTION_DISMISS, 4))
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
